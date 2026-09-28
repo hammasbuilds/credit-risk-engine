@@ -2,68 +2,60 @@
 
     python demo.py
 
-Fits a scorecard on synthetic data where the true relationship is known
-(higher income means lower risk, age carries no signal), then scores one
-applicant and explains the decline in points. No network, no dependencies.
+Fits a scorecard on the package's synthetic loan book, where the true relationships
+are known (higher income means lower risk, employment type matters a little, age is
+noise), then scores one applicant and explains the decline in points.
+No network, no dependencies.
 """
 
-import random
 import sys
+from pathlib import Path
 
-sys.path.insert(0, "src")
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-from creditrisk.binning import bin_numeric
-from creditrisk.scorecard import Scorecard, fit_logistic, gini
+from creditrisk import calibration_table, fit_scorecard, gini, synthetic  # noqa: E402
 
-CUTOFF = 600
+# 527 is the score at which P(default) = 20% on this card's scale (600 at 50:1, PDO 20).
+CUTOFF = 527
+FEATURES = ("income", "age", "employment")
 
+data = synthetic()
+columns = {name: data[name] for name in FEATURES}
+card = fit_scorecard(columns, data["default"])
 
-def synthetic(n: int = 1500, seed: int = 11):
-    """Higher income means lower risk. Age is noise, and should earn ~no points."""
-    rng = random.Random(seed)
-    income = [rng.uniform(20, 200) for _ in range(n)]
-    age = [rng.uniform(21, 70) for _ in range(n)]
-    target = [1 if rng.random() < max(0.02, 0.45 - v / 400) else 0 for v in income]
-    return income, age, target
-
-
-income, age, target = synthetic()
-f_income = bin_numeric("income", income, target, n_bins=5)
-f_age = bin_numeric("age", age, target, n_bins=5)
-rows = [[f_income.transform(i), f_age.transform(a)] for i, a in zip(income, age, strict=False)]
-weights, bias = fit_logistic(rows, target)
-card = Scorecard(
-    {"income": f_income, "age": f_age},
-    {"income": weights[0], "age": weights[1]},
-    bias,
-).build()
-
-applicant = {"income": 34.0, "age": 29.0}
+applicant = {"income": 34.0, "age": 29, "employment": "self-employed"}
 
 print("INPUT")
 print(f"   applicant          {applicant}")
-print(f"   cutoff             {CUTOFF}")
+print(f"   cutoff             {CUTOFF}   (P(default) = 20%)")
 print(
-    f"   scorecard          fitted on {len(income)} accounts, "
-    f"PDO={card.pdo:.0f} base={card.base_score}"
+    f"   scorecard          fitted on {len(data['default'])} synthetic accounts, "
+    f"PDO={card.pdo:.0f}, {card.base_score} at {card.base_odds:.0f}:1"
 )
 print()
+print("   features")
+for name, f in card.features.items():
+    print(f"      {name:12} IV {f.iv:.3f}  {f.strength():10} monotonic={f.is_monotonic()}")
+print()
 
-score = card.score(applicant)
-prob = card.probability(applicant)
+result = card.explain(applicant, cutoff=CUTOFF)
 
 print("OUTPUT")
-print(f"   score              {score}")
-print(f"   P(default)         {prob:.1%}")
-print(f"   decision           {'APPROVE' if score >= CUTOFF else 'DECLINE'}   (cutoff {CUTOFF})")
+print(f"   score              {result['score']}")
+print(f"   P(default)         {result['probability_of_default']:.1%}")
+print(f"   decision           {result['decision']}   (cutoff {CUTOFF})")
 print()
 print("   points breakdown")
-for c in card.contributions(applicant):
-    print(f"      {c.feature:10} {c.bin_label:>18}   {c.points:+4d} pts")
+for p in result["points"]:
+    print(f"      {p['feature']:12} {p['bin']:>16}   {p['points']:+4d} pts")
 print()
-print("   adverse-action reason codes")
-for r in card.reason_codes(applicant):
+print("   adverse-action reason codes, worst first")
+for r in result["reason_codes"]:
     print(f"      {r}")
 print()
-fitted = [card.probability({"income": i, "age": a}) for i, a in zip(income, age, strict=False)]
-print(f"   model gini         {gini(fitted, target):.3f}")
+probs = [card.probability({n: data[n][i] for n in FEATURES}) for i in range(len(data["default"]))]
+table = calibration_table(probs, data["default"], n_bins=5)
+print(f"   model gini         {gini(probs, data['default']):.3f}   (in-sample)")
+print("   calibration        predicted vs observed bad rate, by quintile of risk")
+for row in table:
+    print(f"      n={row['n']}   predicted {row['predicted']:.3f}   observed {row['observed']:.3f}")

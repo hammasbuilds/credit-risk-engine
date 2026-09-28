@@ -7,12 +7,12 @@ help:  ## Show this help
 install:  ## Create .venv and install everything
 	uv sync --all-groups
 
-test:  ## Run the suite - no dependencies at all
+test:  ## Run the suite - needs only pytest
 	uv run pytest -q
 
 lint:  ## Lint
-	uv run ruff check src tests
-	uv run ruff format --check src tests
+	uv run ruff check src tests demo.py
+	uv run ruff format --check src tests demo.py
 
 fmt:  ## Auto-format
 	uv run ruff format src tests

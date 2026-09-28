@@ -2,6 +2,8 @@
 <p align="center"><i>A credit scorecard that can explain every decline, in points, to a regulator</i></p>
 
 <p align="center">
+  <a href="#quickstart">Quickstart</a> &middot;
+  <a href="#command-line">CLI</a> &middot;
   <a href="#why-scorecards-when-gradient-boosting-scores-better">Why scorecards</a> &middot;
   <a href="#weight-of-evidence">Weight of Evidence</a> &middot;
   <a href="#the-points-scale">The points scale</a> &middot;
@@ -12,11 +14,131 @@
 
 <p align="center">
   <a href="https://github.com/hammasbuilds/credit-risk-engine/actions/workflows/ci.yml"><img src="https://github.com/hammasbuilds/credit-risk-engine/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
-  <img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="python">
+  <img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="python">
   <img src="https://img.shields.io/badge/core%20deps-zero-success" alt="deps">
-  <img src="https://img.shields.io/badge/stack-pandas%20%C2%B7%20Streamlit-orange" alt="stack">
+  <img src="https://img.shields.io/badge/stack-pure%20Python%20stdlib-orange" alt="stack">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="license"></a>
 </p>
+
+---
+
+## Quickstart
+
+```bash
+git clone https://github.com/hammasbuilds/credit-risk-engine
+cd credit-risk-engine
+python -m venv .venv
+source .venv/bin/activate      # Windows: .venv\Scripts\activate
+pip install -e ".[dev]"        # the package has zero dependencies; [dev] adds pytest + ruff
+python demo.py
+pytest -q                      # 108 tests
+```
+
+`uv sync` works too and reads the same `dev` group.
+
+One call fits a whole card. `columns` is a dict of lists, or `{c: df[c] for c in cols}`
+from pandas. Text columns are binned by category and the rest by quantile. `None`,
+`NaN`, `pandas.NA` and blank strings all count as missing.
+
+```python
+from creditrisk import audit, fit_scorecard, synthetic
+
+data = synthetic()  # 2,000 synthetic loans where the truth is known; use your own columns
+card = fit_scorecard(
+    {"income": data["income"], "age": data["age"], "employment": data["employment"]},
+    data["default"],  # 1 = defaulted, 0 = repaid
+)
+
+income = card.features["income"]
+print(income.iv, income.strength(), income.is_monotonic())  # 0.396605 strong True
+
+applicant = {"income": 34.0, "age": 29, "employment": "self-employed"}
+print(card.score(applicant))            # 487
+print(card.probability(applicant))      # 0.501065
+print(card.reason_codes(applicant)[0])  # {'feature': 'income', 'bin': '[-inf, 54.2)', 'points': 148, 'points_lost': 52}
+
+# A blank field gets the neutral (population-average) points, not zero.
+print(card.score({"income": 34.0, "employment": "self-employed"}))  # 487
+
+# Fairness audit of the decisions at a cut-off of 527 (P(default) = 20%).
+rows = [{k: data[k][i] for k in ("income", "age", "employment")} for i in range(2000)]
+approved = [int(card.score(r) >= 527) for r in rows]
+report = audit(data["employment"], approved, data["default"])
+print(report["worst_disparate_impact"], report["four_fifths_rule_flag"])  # 0.631053 True
+```
+
+Every number in those comments is what the code prints. `tests/test_readme.py` runs
+the block and checks each one.
+
+The audit groups by employment type because the synthetic book has no protected
+attribute. The flag fires, and `bad_rate_difference` (+0.093 for self-employed) sits
+next to it so the reader can judge how much of the gap real risk explains.
+
+Keeping the card:
+
+```python
+from creditrisk import Scorecard
+
+card.save("card.json")                # plain JSON: bins, WoE, coefficients, points
+card = Scorecard.load("card.json")    # scores identically; a hand-edited points table is refused
+card.points_table()                   # feature / bin / n / bad rate / WoE / points
+card.explain(applicant, cutoff=527)   # score, P(default), points, reasons, decision as one dict
+```
+
+You can still go step by step (`bin_numeric` / `bin_categorical`, then `fit_logistic`,
+then `Scorecard(...).build()`) when you want to choose the edges or merge bins yourself.
+`fit_scorecard` runs those steps for you.
+
+### Scoring rules worth knowing
+
+| Input | What happens |
+|---|---|
+| Field absent, `None`, `NaN` or `""` | goes to the feature's `missing` bin if training had missing values. Otherwise it gets the **neutral** points (WoE 0, the population average), labelled `no matching bin (neutral)` |
+| A category never seen in training | goes to the `missing` bin if there is one, otherwise gets the neutral points |
+| A key that is not a feature (`"Income"`) | `ValueError: unknown field(s) 'Income' (did you mean 'income'?)`. Set `card.on_unknown_field = "ignore"` to pass whole database rows |
+| Text in a numeric field (`"lots"`) | `TypeError` naming the feature. Numeric strings such as `"120"` are accepted |
+| A target that is not 0/1 (`"0"`, `-1`) | `ValueError` naming the row. `"0"` is truthy, so this used to count every row as a default |
+
+If you would rather refuse than guess, set `card.on_unmatched = "raise"`.
+
+## Command line
+
+The same steps without writing Python. Every command takes `--json`.
+
+```bash
+creditrisk sample-data loans.csv                      # the synthetic book as a CSV
+creditrisk fit loans.csv --target default --out card.json
+creditrisk points card.json                           # the card a committee signs
+creditrisk score card.json applicant.json --cutoff 527
+creditrisk audit decisions.csv --group gender --approved approved --outcome default
+```
+
+`fit` takes `--drop id,branch`, `--features`, `--categorical`, `--n-bins`, `--pdo`,
+`--base-score` and `--base-odds`. `score` reads a JSON object, a JSON list, `-` for
+stdin, or a CSV. Add `--ignore-unknown` to skip id columns. Bad input prints one
+`error:` line on stderr and exits with status 2. `python -m creditrisk ...` works too.
+
+```
+$ creditrisk fit loans.csv --target default --out card.json
+fitted on 2000 rows, bad rate 25.3%
+feature          kind              IV  strength                           beta
+income           numeric        0.397  strong                           -0.997
+age              numeric        0.005  useless                          -0.467
+employment       categorical    0.069  weak                             -0.960
+training gini 0.383 (in-sample; hold out data to judge it)
+saved scorecard to card.json
+
+$ echo '{"income": 34, "age": 29, "employment": "self-employed"}' > applicant.json
+$ creditrisk score card.json applicant.json --cutoff 527
+score 487   P(default) 50.1%   DECLINE (cutoff 527)
+   income           [-inf, 54.2)                   148 pts
+   age              [-inf, 31)                     173 pts
+   employment       self-employed                  166 pts
+   reasons, worst first:
+      income           [-inf, 54.2)                 -52 pts
+      employment       self-employed                -13 pts
+      age              [-inf, 31)                   -1 pts
+```
 
 ---
 
@@ -36,14 +158,13 @@ flowchart LR
     style F fill:#f59e0b,color:#fff
 ```
 
-Gradient boosting scores better. **A scorecard can be read by a person** - and when a
+Gradient boosting scores better. **A scorecard can be read by a person.** When a
 regulator asks why an application was declined, "points" is an answer and "feature
 importance" is not.
 
-
-Because in regulated lending **an unexplainable decision is not a decision**. Adverse-
-action notices are a legal requirement in most jurisdictions; a model that cannot
-produce one cannot be deployed whatever its AUC.
+In regulated lending **an unexplainable decision is not a decision**. Most
+jurisdictions require adverse-action notices, and a model that cannot produce one
+cannot be deployed, whatever its AUC.
 
 A scorecard decomposes **exactly**. Each feature contributes a whole number of points
 and those points sum to the score, so:
@@ -53,13 +174,15 @@ and those points sum to the score, so:
 is not an approximation of the decision. It **is** the decision, restated.
 
 ```python
-card.reason_codes({"income": 25, "age": 22})
-# [{"feature": "income", "bin": "[-inf, 56.8)", "points": 242, "points_lost": 76}]
+card.reason_codes({"income": 34.0, "age": 29, "employment": "self-employed"})
+# [{'feature': 'income', 'bin': '[-inf, 54.2)', 'points': 148, 'points_lost': 52},
+#  {'feature': 'employment', 'bin': 'self-employed', 'points': 166, 'points_lost': 13},
+#  {'feature': 'age', 'bin': '[-inf, 31)', 'points': 173, 'points_lost': 1}]
 ```
 
-Reasons are measured against each feature's **best attainable** points — *"you lost 76
+Reasons are measured against each feature's **best attainable** points. *"You lost 52
 points relative to the best possible answer"* is actionable. *"This feature contributed
-242 points"* is not. A factor that cost nothing is not listed, because an adverse-action
+148 points"* is not. A factor that cost nothing is not listed, because an adverse-action
 notice lists reasons for the decline, not a feature inventory.
 
 ## Weight of Evidence
@@ -68,14 +191,16 @@ notice lists reasons for the decline, not a feature inventory.
 WoE = ln( P(good | bin) / P(bad | bin) )
 ```
 
-Three properties fall out, and together they are why the technique has lasted forty
-years: after binning, higher WoE always means lower risk (**monotonic**); WoE is already
-log-odds, the scale logistic regression works on (**linear**); outliers land in the edge
+Three properties follow, and together they are why the technique has lasted forty
+years. After binning, higher WoE always means lower risk (**monotonic**). WoE is already
+log-odds, the scale logistic regression works on (**linear**). Outliers land in the edge
 bin and missing values get their own bin rather than an imputed lie (**robust**).
 
-`is_monotonic()` is checked, not assumed — a feature that is not monotonic cannot be
+`is_monotonic()` is checked, not assumed. A feature that is not monotonic cannot be
 described in one sentence to a credit committee, and a scorecard that cannot be
-described will not be approved.
+described will not be approved. In the demo the noise feature `age` comes out
+non-monotonic, which is the check doing its job. Categories have no order, so a
+categorical feature always passes.
 
 ### Information Value, and the band that matters
 
@@ -88,15 +213,20 @@ described will not be approved.
 ```
 
 The top band is the useful one. An IV above 0.5 almost always means the feature encodes
-the outcome — a collections flag that is only ever set *after* default. That is a test:
-feeding the label back in as a feature must be flagged, not celebrated.
+the outcome, like a collections flag that is only ever set *after* default. There is a
+test for it: feeding the label back in as a feature must be flagged, not celebrated.
 
-Bins smaller than 5% of the population are merged. A bin of nine accounts produces a WoE
-that will not survive contact with next quarter's data.
+The synthetic `income` is built to land in **strong** (IV 0.397), not in the leakage
+band. A flagship example whose real signal tripped the leakage warning would teach the
+reader to ignore the warning.
+
+Bins smaller than 5% of the population are merged into a neighbour: the first bin
+merges forward, every other bin into the next one along. A bin of nine accounts
+produces a WoE that will not survive contact with next quarter's data.
 
 ## The points scale
 
-Two numbers the business chooses, not the model:
+The business chooses two numbers. The model does not:
 
 ```
 factor = PDO / ln 2
@@ -104,24 +234,25 @@ offset = base_score − factor × ln(base_odds)
 score  = offset + factor × ln(odds_good)
 ```
 
-`PDO` is *Points to Double the Odds* — "every 20 points halves the risk". That is
-asserted directly:
+`PDO` is *Points to Double the Odds*: "every 20 points halves the risk". The default
+card puts 600 at 50:1 odds, so on the synthetic book (25% bad rate) the average
+applicant scores about 520. A cut-off of 527 means "approve when P(default) < 20%".
+The PDO property is asserted directly:
 
 ```python
-def test_pdo_doubles_the_odds():
-    assert odds(600 + card.pdo) == pytest.approx(2 * odds(600))
+def test_pdo_doubles_the_odds(self, card):
+    assert odds(600 + card.pdo) == pytest.approx(2 * odds(600), rel=1e-9)
 ```
 
 ### The bug this project taught me
 
 The model predicts `P(bad)`. A credit score is, by universal convention, **log-odds of
-good** — higher is safer. The sign has to flip on the way into points.
+good**: higher is safer. The sign has to flip on the way into points.
 
 I got it wrong first, and the failure is instructive: the scorecard was *statistically
 correct and commercially inverted*. Every metric looked fine; the best applicants simply
-scored lowest. Nothing catches that except checking the direction — so now that check is
-the first test in the file, and `gini` returning **−1.0** for an inverted model is
-another.
+scored lowest. Only a check on the direction catches that, so that check is now the
+first scorecard test, and `gini` returning **−1.0** for an inverted model is another.
 
 ## Calibration, not just discrimination
 
@@ -131,8 +262,8 @@ brier_score(probs, target)   # level    — is 5% actually 5%
 calibration_table(probs, target)
 ```
 
-Both, because they answer different questions. A model can rank perfectly and still be
-badly wrong about the level — and a lender **prices from the level**.
+You need both, because they answer different questions. A model can rank perfectly and
+still be badly wrong about the level, and a lender **prices from the level**.
 
 ## Fairness: four measures, because they are incompatible
 
@@ -146,88 +277,169 @@ and says so in the output.
 | **Demographic parity** | equal approval rates — ignores whether groups differ in actual risk |
 | **Equal opportunity** | equal TPR — among people who *would repay*, equal chance of approval |
 | **Equalised odds** | equal TPR *and* FPR — strictest, rarely achievable |
-| **Disparate impact** | approval-rate ratio; the four-fifths rule flags below 0.8 |
+| **Disparate impact** | approval-rate ratio; the four-fifths rule flags below 0.8, including a group with **zero** approvals |
 
-The reference group is the **largest**, not the alphabetically first — the comparison
+The reference group is the **largest**, not the alphabetically first. The comparison
 people care about is "relative to the majority", and picking it by name is an accident
-waiting for a label to change.
+waiting for a label to change. Naming a reference that does not exist is a `ValueError`
+that lists the groups.
 
-`bad_rate_difference` is reported alongside every gap, because it is the usual
-explanation offered for one and the reader is entitled to judge it rather than be told
-it.
+`bad_rate_difference` is reported alongside every gap. It is the usual explanation
+offered for a gap, and the reader is entitled to judge it rather than be told it.
 
-`threshold_for_parity()` exists to make the trade-off concrete: group-specific cut-offs
-achieve demographic parity *exactly*, and in most jurisdictions using them is itself
-unlawful, because the protected attribute enters the decision. A tool that computes this
-should say so — so it does, in its own docstring.
+`threshold_for_parity()` makes the trade-off concrete. Group-specific cut-offs achieve
+demographic parity *exactly*, and in most jurisdictions using them is itself unlawful,
+because the protected attribute enters the decision. A tool that computes this should
+say so, so it does, in its own docstring. `target_rate` must be in [0, 1], and 0 gives
+a cut-off of +inf.
 
 **On Pakistan:** the PDPA does not yet define algorithmic fairness thresholds. The
 four-fifths rule is applied here as the strictest widely recognised standard rather than
 as a local legal requirement. Erring stricter than the law demands is the defensible
 direction.
 
-## Usage
-
-```python
-income_f = bin_numeric("income", income, target, n_bins=5)
-rows = [[income_f.transform(i), age_f.transform(a)] for i, a in zip(income, age)]
-weights, bias = fit_logistic(rows, target)
-
-card = Scorecard({"income": income_f, "age": age_f},
-                 dict(zip(["income", "age"], weights)), bias).build()
-
-card.score({"income": 180, "age": 45})        # 584
-card.probability({"income": 180, "age": 45})  # 0.0336
-card.reason_codes({"income": 25, "age": 22})
-
-audit(gender, approved, outcomes)
-```
-
 ---
 
-## Input
+## Input / Output
 
-![input](docs/images/input.png)
+`python demo.py` prints the following. It is pasted verbatim, and `tests/test_readme.py`
+checks that it still matches.
 
-## Output
+```
+INPUT
+   applicant          {'income': 34.0, 'age': 29, 'employment': 'self-employed'}
+   cutoff             527   (P(default) = 20%)
+   scorecard          fitted on 2000 synthetic accounts, PDO=20, 600 at 50:1
 
-`python demo.py`
+   features
+      income       IV 0.397  strong     monotonic=True
+      age          IV 0.005  useless    monotonic=False
+      employment   IV 0.069  weak       monotonic=True
 
-![output](docs/images/output.png)
+OUTPUT
+   score              487
+   P(default)         50.1%
+   decision           DECLINE   (cutoff 527)
 
-*The reason code names `income`, not `age` — even though `age` contributed more points.
-What a declined applicant is owed is the factor that cost them the most relative to the
-best available bin, and `age` carries no signal to lose points on.*
+   points breakdown
+      income           [-inf, 54.2)   +148 pts
+      age                [-inf, 31)   +173 pts
+      employment      self-employed   +166 pts
+
+   adverse-action reason codes, worst first
+      {'feature': 'income', 'bin': '[-inf, 54.2)', 'points': 148, 'points_lost': 52}
+      {'feature': 'employment', 'bin': 'self-employed', 'points': 166, 'points_lost': 13}
+      {'feature': 'age', 'bin': '[-inf, 31)', 'points': 173, 'points_lost': 1}
+
+   model gini         0.383   (in-sample)
+   calibration        predicted vs observed bad rate, by quintile of risk
+      n=400   predicted 0.107   observed 0.120
+      n=400   predicted 0.162   observed 0.150
+      n=400   predicted 0.231   observed 0.193
+      n=400   predicted 0.323   observed 0.350
+      n=400   predicted 0.440   observed 0.453
+```
+
+*The top reason is `income`, not `age`, even though `age` contributed more points. A
+declined applicant is owed the factor that cost them the most relative to the best
+available bin, and `age`, which carries no signal, costs at most a point.*
+
+The Gini and the calibration are measured on the same data the card was fitted on. They
+show the card is internally consistent, not that it generalises. Hold out a sample for
+that.
 
 ---
 
 ## Tests
 
-**40 tests. No dependencies, no data download.**
+**108 tests, about 3 seconds. They need nothing beyond pytest: no data download, no
+network.**
 
-Scorecard behaviour is almost entirely exact — WoE is a logarithm, points are a linear
-transform, four-fifths is a ratio — so nearly everything is asserted rather than
-compared against a tolerance.
+Scorecard behaviour is almost entirely exact. WoE is a logarithm, points are a linear
+transform and four-fifths is a ratio, so nearly everything is asserted exactly rather
+than compared against a tolerance.
 
 | Covered | |
 |---|---|
-| Binning | WoE sign, monotonicity, IV bands, **leakage flagged**, zero-bad bins finite, missing bin, small-bin merge, categorical |
-| Scorecard | **direction**, points sum to score, PDO doubles odds, base score at base odds, score/probability agree, missing field |
+| Binning | WoE sign, monotonicity, IV bands, **leakage flagged**, zero-bad bins finite, missing bin, **NaN = missing**, small-bin merge including the first bin, sorted user edges, categorical transform, unseen categories, 0/1 target validation |
+| Scorecard | **direction**, points sum to score, PDO doubles odds, base score at base odds, score/probability agree, **a missing field keeps neutral points**, typo'd keys refused, categorical scoring, coefficient typo refused |
+| Persistence | JSON round trip scores identically, tampered points refused, points table |
+| Fit | Newton matches the closed-form MLE, the gradient is zero at the optimum, separation stays finite, collinearity explained |
 | Reason codes | worst first, measured against best attainable, zero-cost factors excluded |
-| Metrics | Gini at ±1 and 0, Brier rewards calibration, calibration table ordering |
-| Fairness | four-fifths flag, even-handed model not flagged, largest reference group, TPR-only gap, worse-of-two odds gap, base rates, incompatibility stated |
+| Metrics | Gini at ±1 and 0, rank Gini equals pair counting with ties, length checks, Brier, calibration (no runt group, ties not sorted goods-first) |
+| Fairness | four-fifths flag, **zero-approval group flagged**, even-handed model not flagged, largest reference group, unknown reference, TPR-only gap, worse-of-two odds gap, base rates, parity cut-offs and their `target_rate` bounds |
+| CLI and README | fit, score (JSON, CSV, text), points, audit, errors as exit 2. The README quickstart and the demo output above are executed and compared |
 
 ## Limits
 
-- `fit_logistic` is plain gradient descent with L2. Fine on WoE features, where the
-  problem is small and convex; it is not a substitute for a solver on wide raw data.
-- No reject inference. Scoring only the accepted population biases the model, and the
-  standard fixes (parcelling, augmentation) all rest on assumptions worth stating
-  explicitly rather than burying in a function.
+- Pure Python, no numpy. `fit_logistic` is Newton's method (IRLS) with L2, exact to
+  1e-8 on the gradient. On this machine 2,000 rows × 3 features fit in under a second,
+  50,000 × 3 in about 2 s and 50,000 × 8 in about 15 s. Identical WoE rows are
+  collapsed first, so cards with few bins fit faster. `gini` is rank-based,
+  O(n log n): 50,000 rows take about 0.3 s. The package is sized for a scorecard, not
+  for wide raw data.
+- There is no reject inference. Scoring only the accepted population biases the model,
+  and the standard fixes (parcelling, augmentation) all rest on assumptions worth
+  stating explicitly rather than burying in a function.
 - Binning is quantile-based with a size floor, not an optimal monotonic search. The
   monotonicity is *checked*, not enforced.
+- There is no train/test split helper. The Gini and calibration the demo prints are
+  in-sample.
 - The fairness audit measures outcomes. It cannot tell you whether a feature is a proxy
-  for a protected attribute — that needs domain knowledge, not statistics.
+  for a protected attribute. That needs domain knowledge, not statistics.
+
+## Problems hit while building this
+
+**The first scorecard was statistically correct and commercially inverted.** The model
+predicts `P(bad)`, but a credit score is by universal convention the log-odds of *good*:
+higher is safer. Without the sign flip, the best applicants scored **lowest**. Income
+180k returned a score of 397 and a 96% probability of default.
+
+This is the worst bug in the repo because **every metric looked fine**. Gini was
+healthy, calibration was healthy, the reason codes were well-formed. Only a deliberate
+check on the direction catches it. That check is now the first scorecard test, and
+`gini` returning **−1.0** on an inverted model is a second line of defence.
+
+**Information Value above 0.5 was originally labelled "excellent".** It is almost always
+**leakage**: a collections flag that is only ever set after default, or a field filled
+in by the decision itself. *Fixed* by labelling that band `suspicious (check for
+leakage)`, with a test that feeds the label back in as a feature and asserts it is
+flagged rather than celebrated.
+
+**A group with zero approvals was reported as "not flagged".** The code picked the
+worst ratio with `if ratio`. A disparate impact of `0.0` is the most extreme adverse
+impact there is, but it is falsy, so it was dropped. *Fixed* with `is not None`, and a
+test for exactly that group.
+
+**A blank field cost the applicant half their score.** When a feature had no missing
+bin, a blank value matched nothing. The feature's points, including its share of the
+intercept, silently vanished: 529 became 265, a guaranteed decline. A typo'd key
+(`"Income"`) did the same. *Fixed*: an unmatched value now gets the neutral points
+(WoE 0) and its bin label says so, and unknown keys are refused with a did-you-mean.
+
+**Categorical features crashed at scoring.** Category bins were stored as numeric bins
+from −inf to +inf, so matching a value compared a float with a string. *Fixed*: bins now
+carry their category and match on it.
+
+**NaN was treated as a number.** pandas uses NaN for blank cells, and inside `sorted()`
+NaN produced arbitrary quantile edges: bins of 205/512/141/406/86 instead of about 270
+each. *Fixed* by treating None, NaN, pandas.NA and blank strings as missing everywhere.
+
+**The calibration table manufactured miscalibration.** It sorted `(probability,
+outcome)` pairs, so inside a tie every good came before every bad. A group boundary
+inside a tie handed the goods to one group and the bads to the next. A scorecard has
+few distinct scores, so ties are the norm. One demo quintile read predicted 0.231 vs
+observed 0.138; sorting on the probability alone gives 0.231 vs 0.193.
+
+**Gradient descent stopped short of the optimum.** 400 fixed epochs left coefficients
+under-converged (a noise feature at −0.06 against an MLE of −1.15) and took 38 s on 20k
+rows. Newton's method reaches the optimum in a handful of steps. A test checks it
+against the closed-form MLE.
+
+**Reporting one fairness measure was hiding a theorem.** Demographic parity and
+equalised odds cannot both hold when base rates differ between groups. That is proven,
+not a tuning problem. *Fixed* by returning all four measures plus the incompatibility
+note, so the reader has to choose a standard rather than be handed one.
 
 ## Keywords
 
@@ -236,58 +448,3 @@ credit scoring &middot; scorecard &middot; weight of evidence &middot; WoE &midd
 ## License
 
 MIT
-
----
-
-## Run it yourself
-
-```bash
-git clone https://github.com/hammasbuilds/credit-risk-engine
-cd credit-risk-engine
-
-pip install -e .         # zero dependencies to resolve
-pytest -q                # 40 tests, under a second
-```
-
-```python
-from creditrisk import bin_numeric, fit_logistic, Scorecard, gini, brier_score, audit
-
-income_f = bin_numeric("income", income, default_flag, n_bins=5)
-age_f    = bin_numeric("age",    age,    default_flag, n_bins=5)
-print(income_f.iv, income_f.strength(), income_f.is_monotonic())
-
-rows = [[income_f.transform(i), age_f.transform(a)] for i, a in zip(income, age)]
-weights, bias = fit_logistic(rows, default_flag)
-
-card = Scorecard({"income": income_f, "age": age_f},
-                 dict(zip(["income", "age"], weights)), bias).build()
-
-card.score({"income": 180, "age": 45})        # 584
-card.probability({"income": 180, "age": 45})  # 0.0336
-card.reason_codes({"income": 25, "age": 22})  # adverse-action notice
-
-audit(gender, approved, outcomes)             # four fairness measures, all four
-```
-
-## Problems hit while building this
-
-**The first scorecard was statistically correct and commercially inverted.** The model
-predicts `P(bad)`, but a credit score is by universal convention the log-odds of *good*
-— higher is safer. Without the sign flip, the best applicants scored **lowest**: income
-180k returned a score of 397 and a 96% probability of default.
-
-What makes this the worst bug in the repo is that **every metric looked fine**. Gini was
-healthy, calibration was healthy, the reason codes were well-formed. Nothing catches it
-except deliberately checking the direction. That check is now the first test in the file,
-and `gini` returning **−1.0** on an inverted model is a second line of defence.
-
-**Information Value above 0.5 was originally labelled "excellent".** It is almost always
-**leakage** — a collections flag that is only ever set after default, a field populated
-by the decision itself. *Fixed* by labelling that band `suspicious (check for leakage)`,
-with a test that feeds the label back in as a feature and asserts it is flagged rather
-than celebrated.
-
-**Reporting one fairness measure was hiding a theorem.** Demographic parity and
-equalised odds cannot both hold when base rates differ between groups — that is proven,
-not a tuning problem. *Fixed* by returning all four measures plus the incompatibility
-note, so a reader has to choose a standard rather than be handed one.
