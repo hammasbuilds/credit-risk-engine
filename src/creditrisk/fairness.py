@@ -25,8 +25,12 @@ defensible direction to err in.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
+
+from .binning import check_binary_target, is_missing
 
 
 @dataclass
@@ -43,8 +47,8 @@ class GroupMetrics:
 
 def _rates(approved: Sequence[int], outcomes: Sequence[int]) -> tuple[float, float, float]:
     """(TPR, FPR, bad rate). `outcomes` is 1 for bad, so a good is 0."""
-    goods = [(a, y) for a, y in zip(approved, outcomes, strict=False) if y == 0]
-    bads = [(a, y) for a, y in zip(approved, outcomes, strict=False) if y == 1]
+    goods = [(a, y) for a, y in zip(approved, outcomes, strict=True) if y == 0]
+    bads = [(a, y) for a, y in zip(approved, outcomes, strict=True) if y == 1]
 
     tpr = sum(a for a, _ in goods) / len(goods) if goods else 0.0
     fpr = sum(a for a, _ in bads) / len(bads) if bads else 0.0
@@ -52,15 +56,39 @@ def _rates(approved: Sequence[int], outcomes: Sequence[int]) -> tuple[float, flo
     return tpr, fpr, bad_rate
 
 
+def _group_labels(groups: Sequence[Any]) -> list[str]:
+    """Group labels as strings, so 1 and "1" are one group and sorting never mixes types."""
+    labels = []
+    for i, g in enumerate(groups):
+        if is_missing(g):
+            raise ValueError(
+                f"group at row {i} is missing; label it explicitly (e.g. 'unknown') "
+                "so it is audited rather than dropped"
+            )
+        labels.append(str(g))
+    return labels
+
+
 def group_metrics(
-    groups: Sequence[str], approved: Sequence[int], outcomes: Sequence[int]
+    groups: Sequence[Any], approved: Sequence[Any], outcomes: Sequence[Any]
 ) -> dict[str, GroupMetrics]:
+    """Per-group approval rate, TPR, FPR and bad rate.
+
+    `approved` is 1 for approved, 0 for declined; `outcomes` is 1 for bad (default), 0
+    for good. Group labels are compared as strings.
+    """
     if not (len(groups) == len(approved) == len(outcomes)):
-        raise ValueError("groups, approved and outcomes must be the same length")
+        raise ValueError(
+            "groups, approved and outcomes must be the same length "
+            f"({len(groups)}, {len(approved)}, {len(outcomes)})"
+        )
+    labels = _group_labels(groups)
+    approved = check_binary_target(approved, "approved")
+    outcomes = check_binary_target(outcomes, "outcomes")
 
     out: dict[str, GroupMetrics] = {}
-    for name in sorted(set(groups)):
-        idx = [i for i, g in enumerate(groups) if g == name]
+    for name in sorted(set(labels)):
+        idx = [i for i, g in enumerate(labels) if g == name]
         group_approved = [approved[i] for i in idx]
         group_outcomes = [outcomes[i] for i in idx]
         tpr, fpr, bad_rate = _rates(group_approved, group_outcomes)
@@ -77,9 +105,9 @@ def group_metrics(
 
 
 def audit(
-    groups: Sequence[str],
-    approved: Sequence[int],
-    outcomes: Sequence[int],
+    groups: Sequence[Any],
+    approved: Sequence[Any],
+    outcomes: Sequence[Any],
     *,
     reference: str | None = None,
 ) -> dict:
@@ -97,7 +125,11 @@ def audit(
             "note": "fewer than two groups; nothing to compare",
         }
 
-    reference = reference or max(metrics.values(), key=lambda m: m.n).group
+    if reference is None:
+        reference = max(metrics.values(), key=lambda m: m.n).group
+    elif str(reference) not in metrics:
+        raise ValueError(f"reference group {reference!r} not found; groups are {sorted(metrics)}")
+    reference = str(reference)
     ref = metrics[reference]
 
     comparisons = {}
@@ -122,7 +154,11 @@ def audit(
             "bad_rate_difference": round(m.bad_rate - ref.bad_rate, 6),
         }
 
-    ratios = [c["disparate_impact"] for c in comparisons.values() if c["disparate_impact"]]
+    # `is not None`, not truthiness: a group with zero approvals has a ratio of 0.0,
+    # the most extreme adverse impact there is, and must not be dropped.
+    ratios = [
+        c["disparate_impact"] for c in comparisons.values() if c["disparate_impact"] is not None
+    ]
     worst = min(ratios) if ratios else None
 
     return {
@@ -141,7 +177,7 @@ def audit(
 
 
 def threshold_for_parity(
-    scores: Sequence[float], groups: Sequence[str], *, target_rate: float
+    scores: Sequence[float], groups: Sequence[Any], *, target_rate: float
 ) -> dict[str, float]:
     """Per-group cut-offs that equalise approval rates.
 
@@ -150,13 +186,25 @@ def threshold_for_parity(
     them is itself unlawful, because the protected attribute enters the decision.
 
     A tool that computes this should say so, which is why it is said here.
+
+    Returns, per group, the lowest score to approve (approve when ``score >= cutoff``).
+    `target_rate` is the fraction to approve, in [0, 1]; 0 gives a cut-off of +inf.
+    Tied scores at the cut-off are all approved, so a group's realised rate can exceed
+    the target when many applicants share one score.
     """
+    if isinstance(target_rate, bool) or not 0.0 <= target_rate <= 1.0:
+        raise ValueError(f"target_rate must be a fraction in [0, 1], got {target_rate!r}")
+    if len(scores) != len(groups):
+        raise ValueError(
+            f"scores and groups must be the same length ({len(scores)} vs {len(groups)})"
+        )
+    labels = _group_labels(groups)
     out: dict[str, float] = {}
-    for name in sorted(set(groups)):
-        group_scores = sorted(s for s, g in zip(scores, groups, strict=False) if g == name)
-        if not group_scores:
-            continue
-        # Approve the top `target_rate` fraction.
-        index = int((1 - target_rate) * len(group_scores))
-        out[name] = float(group_scores[min(index, len(group_scores) - 1)])
+    for name in sorted(set(labels)):
+        group_scores = sorted(
+            (float(s) for s, g in zip(scores, labels, strict=True) if g == name), reverse=True
+        )
+        # Approve the top ceil(target_rate * n) applicants.
+        n_approve = math.ceil(target_rate * len(group_scores) - 1e-9)
+        out[name] = math.inf if n_approve == 0 else group_scores[n_approve - 1]
     return out
