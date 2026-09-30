@@ -8,8 +8,7 @@
   <a href="#weight-of-evidence">Weight of Evidence</a> &middot;
   <a href="#the-points-scale">The points scale</a> &middot;
   <a href="#calibration-not-just-discrimination">Calibration</a> &middot;
-  <a href="#fairness-four-measures-because-they-are-incompatible">Fairness</a> &middot;
-  <a href="#problems-hit-while-building-this">Problems hit</a>
+  <a href="#fairness-four-measures-because-they-are-incompatible">Fairness</a> 
 </p>
 
 <p align="center">
@@ -387,59 +386,6 @@ than compared against a tolerance.
   in-sample.
 - The fairness audit measures outcomes. It cannot tell you whether a feature is a proxy
   for a protected attribute. That needs domain knowledge, not statistics.
-
-## Problems hit while building this
-
-**The first scorecard was statistically correct and commercially inverted.** The model
-predicts `P(bad)`, but a credit score is by universal convention the log-odds of *good*:
-higher is safer. Without the sign flip, the best applicants scored **lowest**. Income
-180k returned a score of 397 and a 96% probability of default.
-
-This is the worst bug in the repo because **every metric looked fine**. Gini was
-healthy, calibration was healthy, the reason codes were well-formed. Only a deliberate
-check on the direction catches it. That check is now the first scorecard test, and
-`gini` returning **−1.0** on an inverted model is a second line of defence.
-
-**Information Value above 0.5 was originally labelled "excellent".** It is almost always
-**leakage**: a collections flag that is only ever set after default, or a field filled
-in by the decision itself. *Fixed* by labelling that band `suspicious (check for
-leakage)`, with a test that feeds the label back in as a feature and asserts it is
-flagged rather than celebrated.
-
-**A group with zero approvals was reported as "not flagged".** The code picked the
-worst ratio with `if ratio`. A disparate impact of `0.0` is the most extreme adverse
-impact there is, but it is falsy, so it was dropped. *Fixed* with `is not None`, and a
-test for exactly that group.
-
-**A blank field cost the applicant half their score.** When a feature had no missing
-bin, a blank value matched nothing. The feature's points, including its share of the
-intercept, silently vanished: 529 became 265, a guaranteed decline. A typo'd key
-(`"Income"`) did the same. *Fixed*: an unmatched value now gets the neutral points
-(WoE 0) and its bin label says so, and unknown keys are refused with a did-you-mean.
-
-**Categorical features crashed at scoring.** Category bins were stored as numeric bins
-from −inf to +inf, so matching a value compared a float with a string. *Fixed*: bins now
-carry their category and match on it.
-
-**NaN was treated as a number.** pandas uses NaN for blank cells, and inside `sorted()`
-NaN produced arbitrary quantile edges: bins of 205/512/141/406/86 instead of about 270
-each. *Fixed* by treating None, NaN, pandas.NA and blank strings as missing everywhere.
-
-**The calibration table manufactured miscalibration.** It sorted `(probability,
-outcome)` pairs, so inside a tie every good came before every bad. A group boundary
-inside a tie handed the goods to one group and the bads to the next. A scorecard has
-few distinct scores, so ties are the norm. One demo quintile read predicted 0.231 vs
-observed 0.138; sorting on the probability alone gives 0.231 vs 0.193.
-
-**Gradient descent stopped short of the optimum.** 400 fixed epochs left coefficients
-under-converged (a noise feature at −0.06 against an MLE of −1.15) and took 38 s on 20k
-rows. Newton's method reaches the optimum in a handful of steps. A test checks it
-against the closed-form MLE.
-
-**Reporting one fairness measure was hiding a theorem.** Demographic parity and
-equalised odds cannot both hold when base rates differ between groups. That is proven,
-not a tuning problem. *Fixed* by returning all four measures plus the incompatibility
-note, so the reader has to choose a standard rather than be handed one.
 
 ## Keywords
 
