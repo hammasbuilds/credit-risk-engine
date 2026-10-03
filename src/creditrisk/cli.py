@@ -16,6 +16,7 @@ import argparse
 import csv
 import json
 import math
+import random
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -24,7 +25,7 @@ from typing import Any
 from . import __version__
 from .datasets import synthetic
 from .fairness import audit
-from .scorecard import Scorecard, fit_scorecard, gini
+from .scorecard import Scorecard, brier_score, fit_scorecard, gini
 
 
 class InputError(Exception):
@@ -96,9 +97,23 @@ def cmd_fit(args: argparse.Namespace) -> int:
     if not wanted:
         raise InputError("no feature columns left after --drop")
     columns = {name: _column(rows, name, args.data) for name in wanted}
+    if not 0 <= args.holdout < 1:
+        raise InputError(f"--holdout must be in [0, 1), got {args.holdout}")
+    # Stratified split: the same bad rate in both parts, so a small book does not end
+    # up with a holdout that has no defaults to rank.
+    rng = random.Random(args.seed)
+    test_idx: set[int] = set()
+    for label in (0, 1):
+        idx = [i for i, t in enumerate(target) if t == label]
+        rng.shuffle(idx)
+        test_idx.update(idx[: round(len(idx) * args.holdout)])
+    train_idx = [i for i in range(len(target)) if i not in test_idx]
+    held = sorted(test_idx)
+    if args.holdout and (not held or len(set(target[i] for i in held)) < 2):
+        raise InputError("holdout has too few rows to contain both classes; lower --holdout")
     card = fit_scorecard(
-        columns,
-        target,
+        {n: [columns[n][i] for i in train_idx] for n in wanted},
+        [target[i] for i in train_idx],
         categorical=_split(args.categorical),
         n_bins=args.n_bins,
         min_bin_fraction=args.min_bin_fraction,
@@ -106,11 +121,19 @@ def cmd_fit(args: argparse.Namespace) -> int:
         base_score=args.base_score,
         base_odds=args.base_odds,
     )
-    probs = [card.probability({n: columns[n][i] for n in wanted}) for i in range(len(target))]
+
+    def scored(idx: list[int]) -> tuple[list[float], list[int]]:
+        return [card.probability({n: columns[n][i] for n in wanted}) for i in idx], [
+            target[i] for i in idx
+        ]
+
+    train_p, train_y = scored(train_idx)
     summary = {
         "rows": len(target),
+        "train_rows": len(train_idx),
+        "holdout_rows": len(held),
         "bad_rate": round(sum(target) / len(target), 6),
-        "training_gini": gini(probs, target),
+        "training_gini": gini(train_p, train_y),
         "features": [
             {
                 "feature": name,
@@ -124,20 +147,37 @@ def cmd_fit(args: argparse.Namespace) -> int:
             for name, f in card.features.items()
         ],
     }
+    if held:
+        test_p, test_y = scored(held)
+        summary["holdout_gini"] = gini(test_p, test_y)
+        summary["holdout_brier"] = brier_score(test_p, test_y)
+        summary["holdout_mean_predicted"] = round(sum(test_p) / len(test_p), 6)
+        summary["holdout_bad_rate"] = round(sum(test_y) / len(test_y), 6)
     if args.out:
         card.save(args.out)
         summary["saved_to"] = str(args.out)
     if args.json:
         _emit(summary)
         return 0
-    print(f"fitted on {summary['rows']} rows, bad rate {summary['bad_rate']:.1%}")
+    print(
+        f"fitted on {summary['train_rows']} of {summary['rows']} rows "
+        f"({summary['holdout_rows']} held out), bad rate {summary['bad_rate']:.1%}"
+    )
     print(f"{'feature':<16} {'kind':<12} {'IV':>7}  {'strength':<30} {'beta':>8}")
     for f in summary["features"]:
         print(
             f"{f['feature']:<16} {f['kind']:<12} {f['iv']:>7.3f}  "
             f"{f['strength']:<30} {f['coefficient']:>8.3f}"
         )
-    print(f"training gini {summary['training_gini']:.3f} (in-sample; hold out data to judge it)")
+    print(f"training gini {summary['training_gini']:.3f} (in-sample)")
+    if held:
+        print(
+            f"holdout gini  {summary['holdout_gini']:.3f}, brier {summary['holdout_brier']:.4f}, "
+            f"mean P(default) {summary['holdout_mean_predicted']:.1%} vs observed "
+            f"{summary['holdout_bad_rate']:.1%} ({summary['holdout_rows']} rows never seen)"
+        )
+    else:
+        print("no holdout (--holdout 0): the gini above flatters the card")
     if args.out:
         print(f"saved scorecard to {args.out}")
     else:
@@ -194,9 +234,14 @@ def cmd_score(args: argparse.Namespace) -> int:
     results = []
     for i, app in enumerate(_applications(args.applications)):
         try:
-            results.append(card.explain(app, cutoff=args.cutoff))
+            r = card.explain(app, cutoff=args.cutoff)
         except (ValueError, TypeError) as e:
             raise InputError(f"application {i + 1}: {e}") from None
+        if r["warnings"] and args.strict:
+            raise InputError(f"application {i + 1}: {r['warnings'][0]} (--strict)")
+        for w in r["warnings"]:
+            print(f"warning: application {i + 1}: {w}", file=sys.stderr)
+        results.append(r)
     if args.json:
         _emit(results if len(results) != 1 else results[0])
         return 0
@@ -290,6 +335,13 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--pdo", type=float, default=20.0)
     f.add_argument("--base-score", type=int, default=600)
     f.add_argument("--base-odds", type=float, default=50.0)
+    f.add_argument(
+        "--holdout",
+        type=float,
+        default=0.2,
+        help="fraction held out (stratified) for an out-of-sample gini; 0 to fit on all",
+    )
+    f.add_argument("--seed", type=int, default=0, help="seed for the holdout split")
     f.add_argument("--out", help="write the scorecard JSON here")
     f.add_argument("--json", action="store_true")
     f.set_defaults(func=cmd_fit)
@@ -305,6 +357,11 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--cutoff", type=int, help="approve at or above this score")
     c.add_argument(
         "--ignore-unknown", action="store_true", help="skip fields the scorecard does not use"
+    )
+    c.add_argument(
+        "--strict",
+        action="store_true",
+        help="refuse values outside the training range or unseen categories (default: warn)",
     )
     c.add_argument("--json", action="store_true")
     c.set_defaults(func=cmd_score)

@@ -216,6 +216,20 @@ class Scorecard:
         # A reason that cost nothing is not a reason for the decline.
         return [r for r in reasons if r["points_lost"] > 0][:limit]
 
+    def warnings(self, application: Mapping[str, Any]) -> list[str]:
+        """Values outside the training range, and categories training never saw.
+
+        Such an application still gets a score (the end bins are open), but the score
+        is an extrapolation; a pipeline should route it to a human.
+        """
+        self._check(application)
+        out = []
+        for name, feature in self.features.items():
+            msg = feature.range_warning(application.get(name))
+            if msg:
+                out.append(msg)
+        return out
+
     def explain(self, application: Mapping[str, Any], *, cutoff: int | None = None) -> dict:
         """Score, probability, per-feature points and reason codes as one JSON-ready dict."""
         contributions = self.contributions(application)
@@ -228,6 +242,7 @@ class Scorecard:
                 for c in contributions
             ],
             "reason_codes": self.reason_codes(application),
+            "warnings": self.warnings(application),
         }
         if cutoff is not None:
             out["cutoff"] = cutoff

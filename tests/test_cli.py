@@ -26,7 +26,9 @@ def loans(workdir):
 def card_path(workdir, loans):
     """Fitted once for the module; the tests only read it."""
     path = workdir / "card.json"
-    assert main(["fit", str(loans), "--target", "default", "--out", str(path)]) == 0
+    assert (
+        main(["fit", str(loans), "--target", "default", "--out", str(path), "--holdout", "0"]) == 0
+    )
     return path
 
 
@@ -122,3 +124,47 @@ def test_bad_input_is_reported_not_raised(argv, message, loans, capsys):
     argv = [a.replace("{loans}", str(loans)) for a in argv]
     assert main(argv) == 2
     assert message in capsys.readouterr().err
+
+
+def test_impossible_values_warn_and_strict_refuses(card_path, tmp_path, capsys):
+    bad = tmp_path / "bad.json"
+    bad.write_text('{"income": -5, "age": 200, "employment": "astronaut"}', encoding="utf-8")
+    assert main(["score", str(card_path), str(bad), "--json"]) == 0
+    captured = capsys.readouterr()
+    warnings = json.loads(captured.out)["warnings"]
+    assert len(warnings) == 3
+    assert "income=-5 is outside the training range" in captured.err
+    assert "age=200" in captured.err and "'astronaut' was never seen" in captured.err
+    assert main(["score", str(card_path), str(bad), "--strict"]) == 2
+    assert "--strict" in capsys.readouterr().err
+
+
+def test_in_range_applicant_has_no_warnings(card_path, tmp_path, capsys):
+    ok = tmp_path / "ok.json"
+    ok.write_text('{"income": 80, "age": 40, "employment": "salaried"}', encoding="utf-8")
+    assert main(["score", str(card_path), str(ok), "--json", "--strict"]) == 0
+    assert json.loads(capsys.readouterr().out)["warnings"] == []
+
+
+def test_fit_reports_a_held_out_gini(loans, tmp_path, capsys):
+    args = ["fit", str(loans), "--target", "default", "--json"]
+    assert main(args) == 0
+    s = json.loads(capsys.readouterr().out)
+    assert (s["train_rows"], s["holdout_rows"]) == (1600, 400)
+    assert 0.2 < s["holdout_gini"] < 0.6 and 0 < s["holdout_brier"] < 0.25
+    assert main([*args, "--holdout", "0"]) == 0
+    s = json.loads(capsys.readouterr().out)
+    assert s["holdout_rows"] == 0 and "holdout_gini" not in s
+    assert main([*args, "--holdout", "1.5"]) == 2
+    assert "--holdout" in capsys.readouterr().err
+
+
+def test_card_without_a_stored_range_still_loads(card_path):
+    from creditrisk import Scorecard
+
+    d = json.loads(card_path.read_text(encoding="utf-8"))
+    for f in d["features"].values() if isinstance(d["features"], dict) else d["features"]:
+        f.pop("range", None)
+    card = Scorecard.from_dict(d)
+    assert card.warnings({"income": -5, "age": 200, "employment": "salaried"}) == []
+    assert Scorecard.load(card_path).features["age"].observed_max == 70

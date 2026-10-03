@@ -189,6 +189,31 @@ class BinnedFeature:
     woe: dict[str, float] = field(default_factory=dict)
     iv: float = 0.0
     kind: str = "numeric"  # or "categorical"
+    # Smallest and largest value seen in training (numeric only; None on old cards).
+    observed_min: float | None = None
+    observed_max: float | None = None
+
+    def range_warning(self, value: Any) -> str | None:
+        """Why `value` is outside what this feature was trained on, or None.
+
+        The bins are open-ended, so age 200 or income -5 still land in an end bin and
+        get a score. That score is an extrapolation nobody validated; this says so.
+        """
+        if is_missing(value):
+            return None
+        if self.kind == "categorical":
+            if any(b.category == str(value) for b in self.bins):
+                return None
+            return f"{self.name}={value!r} was never seen in training; scored as missing/neutral"
+        if self.observed_min is None or self.observed_max is None:
+            return None
+        number = _as_number(self.name, value)
+        if self.observed_min <= number <= self.observed_max:
+            return None
+        return (
+            f"{self.name}={number:g} is outside the training range "
+            f"[{self.observed_min:g}, {self.observed_max:g}]; the score extrapolates"
+        )
 
     def find_bin(self, value: Any) -> Bin | None:
         """The bin a value falls in, or None if no bin fits.
@@ -259,6 +284,11 @@ class BinnedFeature:
             "name": self.name,
             "kind": self.kind,
             "iv": self.iv,
+            **(
+                {"range": [self.observed_min, self.observed_max]}
+                if self.observed_min is not None
+                else {}
+            ),
             "bins": [dict(b.to_dict(), woe=self.woe[b.label]) for b in self.bins],
         }
 
@@ -266,7 +296,16 @@ class BinnedFeature:
     def from_dict(cls, d: dict) -> BinnedFeature:
         bins = [Bin.from_dict(b) for b in d["bins"]]
         woe = {b["label"]: float(b["woe"]) for b in d["bins"]}
-        return cls(name=d["name"], bins=bins, woe=woe, iv=float(d["iv"]), kind=d["kind"])
+        lo, hi = d.get("range") or (None, None)
+        return cls(
+            name=d["name"],
+            bins=bins,
+            woe=woe,
+            iv=float(d["iv"]),
+            kind=d["kind"],
+            observed_min=None if lo is None else float(lo),
+            observed_max=None if hi is None else float(hi),
+        )
 
 
 def _woe_and_iv(bins: list[Bin]) -> tuple[dict[str, float], float]:
@@ -370,7 +409,16 @@ def bin_numeric(
         merged.append(missing_bin)
 
     woe, iv = _woe_and_iv(merged)
-    return BinnedFeature(name=name, bins=merged, woe=woe, iv=iv, kind="numeric")
+    seen = [v for v in numbers_ if v is not None]
+    return BinnedFeature(
+        name=name,
+        bins=merged,
+        woe=woe,
+        iv=iv,
+        kind="numeric",
+        observed_min=min(seen) if seen else None,
+        observed_max=max(seen) if seen else None,
+    )
 
 
 def bin_categorical(name: str, values: Sequence[Any], target: Sequence[Any]) -> BinnedFeature:

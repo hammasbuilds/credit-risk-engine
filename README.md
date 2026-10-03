@@ -30,7 +30,7 @@ python -m venv .venv
 source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"        # the package has zero dependencies; [dev] adds pytest + ruff
 python demo.py
-pytest -q                      # 108 tests
+pytest -q                      # 112 tests
 ```
 
 `uv sync` works too and reads the same `dev` group.
@@ -117,26 +117,53 @@ creditrisk audit decisions.csv --group gender --approved approved --outcome defa
 stdin, or a CSV. Add `--ignore-unknown` to skip id columns. Bad input prints one
 `error:` line on stderr and exits with status 2. `python -m creditrisk ...` works too.
 
+`fit` holds out a stratified 20% (`--holdout`, `--seed`; `--holdout 0` fits on every
+row) and saves the card fitted on the other 80%, so the holdout gini, Brier score and
+mean-predicted-vs-observed bad rate describe the card you keep. Here the holdout gini
+(0.381) matches the in-sample one (0.378): five bins and three coefficients have little
+room to overfit 1,600 rows.
+
+`score` checks each value against the card: a number outside the range seen in
+training, or a category training never saw, is still scored (the end bins are open)
+but prints a `warning:` line on stderr and lands in the JSON under `"warnings"`; pass
+`--strict` to refuse it with exit 2 instead. For `{"income": -5, "age": 200,
+"employment": "astronaut"}`:
+
+```text
+warning: application 1: income=-5 is outside the training range [20.2, 199.9]; the score extrapolates
+warning: application 1: age=200 is outside the training range [21, 70]; the score extrapolates
+warning: application 1: employment='astronaut' was never seen in training; scored as missing/neutral
+```
+
+In Python, `card.warnings(application)` returns the same list. Cards saved before this
+check carry no training range, so only unseen categories are flagged for them.
+
+For a real book instead of the synthetic one, the UCI German Credit data
+(`statlog/german`, 1,000 loans) works once its space-separated file is saved as a CSV
+with a header and its 1/2 class column recoded to 0 (good) / 1 (bad): then
+`creditrisk fit german.csv --target bad --categorical <the A-coded columns>`. No numbers
+for it are quoted here because none were run in this repo.
+
 ```
 $ creditrisk fit loans.csv --target default --out card.json
-fitted on 2000 rows, bad rate 25.3%
+fitted on 1600 of 2000 rows (400 held out), bad rate 25.3%
 feature          kind              IV  strength                           beta
-income           numeric        0.397  strong                           -0.997
-age              numeric        0.005  useless                          -0.467
-employment       categorical    0.069  weak                             -0.960
-training gini 0.383 (in-sample; hold out data to judge it)
+income           numeric        0.383  strong                           -0.995
+age              numeric        0.002  useless                          -0.179
+employment       categorical    0.075  weak                             -0.954
+training gini 0.378 (in-sample)
+holdout gini  0.381, brier 0.1720, mean P(default) 25.3% vs observed 25.2% (400 rows never seen)
 saved scorecard to card.json
 
 $ echo '{"income": 34, "age": 29, "employment": "self-employed"}' > applicant.json
 $ creditrisk score card.json applicant.json --cutoff 527
-score 487   P(default) 50.1%   DECLINE (cutoff 527)
-   income           [-inf, 54.2)                   148 pts
+score 485   P(default) 51.8%   DECLINE (cutoff 527)
+   income           [-inf, 54.6)                   147 pts
    age              [-inf, 31)                     173 pts
-   employment       self-employed                  166 pts
+   employment       self-employed                  165 pts
    reasons, worst first:
-      income           [-inf, 54.2)                 -52 pts
-      employment       self-employed                -13 pts
-      age              [-inf, 31)                   -1 pts
+      income           [-inf, 54.6)                 -51 pts
+      employment       self-employed                -14 pts
 ```
 
 ---
@@ -351,7 +378,7 @@ that.
 
 ## Tests
 
-**108 tests, about 3 seconds. They need nothing beyond pytest: no data download, no
+**112 tests, a few seconds. They need nothing beyond pytest: no data download, no
 network.**
 
 Scorecard behaviour is almost entirely exact. WoE is a logarithm, points are a linear
